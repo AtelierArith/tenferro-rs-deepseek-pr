@@ -1,17 +1,16 @@
 name: review bot
 
-# Delta-scoped REPOSITORY_RULES review for same-repo PRs. Fork PRs skip the
-# LLM call and pass the gate job, matching CI_gpu.yml's same-repo-only pattern.
+# Delta-scoped REPOSITORY_RULES review. This workflow runs from the trusted base
+# revision and treats PR contents as data only: it fetches the PR head for git
+# diffs, but never checks out or executes files from the PR branch.
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
-  pull-requests: write
-  checks: write
 
 concurrency:
   group: review-bot-${{ github.event.pull_request.number }}
@@ -23,23 +22,30 @@ env:
 jobs:
   review-bot:
     name: repository rules review (LLM)
-    if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      !contains(github.event.pull_request.labels.*.name, 'rules-review:waive')
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout trusted base revision
+        uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Resolve merge base
-        id: base
+      - name: Fetch PR head for diff only
+        id: refs
         run: |
           set -euo pipefail
-          git fetch origin "${{ github.base_ref }}"
-          merge_base="$(git merge-base "origin/${{ github.base_ref }}" "${{ github.event.pull_request.head.sha }}")"
-          echo "ref=${merge_base}" >> "${GITHUB_OUTPUT}"
+          pr_ref="refs/remotes/origin/pr-${{ github.event.pull_request.number }}"
+          git fetch --no-tags --no-recurse-submodules origin \
+            "+refs/pull/${{ github.event.pull_request.number }}/head:${pr_ref}"
+          merge_base="$(git merge-base HEAD "${pr_ref}")"
+          echo "base=${merge_base}" >> "${GITHUB_OUTPUT}"
+          echo "head=${pr_ref}" >> "${GITHUB_OUTPUT}"
 
       - name: Run repository rules review
         id: review
@@ -49,8 +55,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/repository-rules-review.py \
-            --base "${{ steps.base.outputs.ref }}" \
-            --head "${{ github.event.pull_request.head.sha }}" \
+            --base "${{ steps.refs.outputs.base }}" \
+            --head "${{ steps.refs.outputs.head }}" \
             --output-json review-report.json \
             | tee review-report.txt
 
@@ -63,10 +69,23 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issue_number = context.payload.pull_request.number;
+            const maxReportChars = 60000;
+
+            function escapeReport(text) {
+              let value = text;
+              if (value.length > maxReportChars) {
+                value = value.slice(0, maxReportChars) + "\n...[truncated]";
+              }
+              return value
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/@/g, "@&#8203;");
+            }
 
             let body = "## Repository rules review\n\n";
             if (fs.existsSync("review-report.txt")) {
-              body += "```text\n" + fs.readFileSync("review-report.txt", "utf8") + "\n```\n";
+              body += "<pre>" + escapeReport(fs.readFileSync("review-report.txt", "utf8")) + "</pre>\n";
             } else {
               body += "Review step did not produce a report.\n";
             }
@@ -109,22 +128,33 @@ jobs:
 
   review-bot-waived:
     name: repository rules review (waived)
-    if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      contains(github.event.pull_request.labels.*.name, 'rules-review:waive')
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'rules-review:waive') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout trusted base revision
+        uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch PR head for diff only
+        id: refs
+        run: |
+          set -euo pipefail
+          pr_ref="refs/remotes/origin/pr-${{ github.event.pull_request.number }}"
+          git fetch --no-tags --no-recurse-submodules origin \
+            "+refs/pull/${{ github.event.pull_request.number }}/head:${pr_ref}"
+          merge_base="$(git merge-base HEAD "${pr_ref}")"
+          echo "base=${merge_base}" >> "${GITHUB_OUTPUT}"
+          echo "head=${pr_ref}" >> "${GITHUB_OUTPUT}"
       - name: Record waiver
         run: |
           set -euo pipefail
-          git fetch origin "${{ github.base_ref }}"
-          merge_base="$(git merge-base "origin/${{ github.base_ref }}" "${{ github.event.pull_request.head.sha }}")"
           python3 scripts/repository-rules-review.py \
-            --base "${merge_base}" \
-            --head "${{ github.event.pull_request.head.sha }}" \
+            --base "${{ steps.refs.outputs.base }}" \
+            --head "${{ steps.refs.outputs.head }}" \
             --waived \
             --dry-run
 
@@ -136,16 +166,11 @@ jobs:
     steps:
       - name: Require review result
         env:
-          IS_FORK_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
           REVIEW_RESULT: ${{ needs.review-bot.result }}
           WAIVED_RESULT: ${{ needs.review-bot-waived.result }}
           REVIEW_WAIVE_LABEL: ${{ env.REVIEW_WAIVE_LABEL }}
         run: |
           set -euo pipefail
-          if [ "${IS_FORK_PR}" = "true" ]; then
-            echo "Fork PR: repository rules LLM review skipped."
-            exit 0
-          fi
           if [ "${WAIVED_RESULT}" = "success" ]; then
             echo "Review waived via label ${REVIEW_WAIVE_LABEL}."
             exit 0

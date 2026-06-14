@@ -98,6 +98,17 @@ def test_split_diff_chunks_respects_limit() -> None:
     assert len(chunks) >= 2
 
 
+def test_scan_runtime_boundary_text_reports_forbidden_symbol() -> None:
+    mod = load_module()
+    violations = mod.scan_runtime_boundary_text(
+        "crates/tenferro-runtime/src/lib.rs",
+        "pub struct Safe;\npub struct EagerTensor;\n",
+    )
+    assert violations == [
+        "crates/tenferro-runtime/src/lib.rs:2: pub struct EagerTensor;"
+    ]
+
+
 def main() -> int:
     for test in [
         test_added_lines_by_file,
@@ -107,6 +118,7 @@ def main() -> int:
         test_select_rule_sections_includes_ad_for_ad_paths,
         test_extract_json_payload_strips_fence,
         test_split_diff_chunks_respects_limit,
+        test_scan_runtime_boundary_text_reports_forbidden_symbol,
     ]:
         test()
     return 0

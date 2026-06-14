@@ -31,6 +31,9 @@ DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_API_URL = "https://api.deepseek.com/v1/chat/completions"
 MAX_DIFF_CHARS = 120_000
 MAX_FILE_DIFF_CHARS = 40_000
+RUNTIME_AD_FORBIDDEN = re.compile(
+    r"\b(ADRule|EagerRuntime|EagerTensor|autodiff|chainrules|tidu)\b"
+)
 
 ALWAYS_SECTIONS = frozenset(
     {
@@ -475,7 +478,64 @@ def format_report(
     return "\n".join(lines)
 
 
-def deterministic_checks(files: list[str]) -> list[Finding]:
+def runtime_boundary_files_in_worktree() -> list[str]:
+    runtime = ROOT / "crates" / "tenferro-runtime"
+    checked = [runtime / "Cargo.toml"]
+    checked.extend(sorted((runtime / "src").rglob("*.rs")))
+    return [path.relative_to(ROOT).as_posix() for path in checked if path.is_file()]
+
+
+def runtime_boundary_files_at_ref(ref: str) -> list[str]:
+    output = run_git(
+        ["ls-tree", "-r", "--name-only", ref, "--", "crates/tenferro-runtime"]
+    )
+    return [
+        path
+        for path in output.splitlines()
+        if path == "crates/tenferro-runtime/Cargo.toml"
+        or (
+            path.startswith("crates/tenferro-runtime/src/")
+            and path.endswith(".rs")
+        )
+    ]
+
+
+def runtime_boundary_text(path: str, *, ref: str | None, worktree: bool) -> str:
+    if worktree:
+        return (ROOT / path).read_text(encoding="utf-8")
+    if ref is None:
+        raise ValueError("ref is required when worktree is false")
+    return run_git(["show", f"{ref}:{path}"])
+
+
+def scan_runtime_boundary_text(path: str, text: str) -> list[str]:
+    violations: list[str] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if RUNTIME_AD_FORBIDDEN.search(line):
+            violations.append(f"{path}:{line_no}: {line}")
+    return violations
+
+
+def runtime_ad_boundary_violations(*, ref: str | None, worktree: bool) -> list[str]:
+    resolved_ref = ref or "HEAD"
+    paths = (
+        runtime_boundary_files_in_worktree()
+        if worktree
+        else runtime_boundary_files_at_ref(resolved_ref)
+    )
+    violations: list[str] = []
+    for path in paths:
+        text = runtime_boundary_text(path, ref=resolved_ref, worktree=worktree)
+        violations.extend(scan_runtime_boundary_text(path, text))
+    return violations
+
+
+def deterministic_checks(
+    files: list[str],
+    *,
+    head: str | None = None,
+    worktree: bool = False,
+) -> list[Finding]:
     findings: list[Finding] = []
     ad_touched = any(
         "ad/" in path or "linearize" in path or "transpose_rule" in path
@@ -483,15 +543,8 @@ def deterministic_checks(files: list[str]) -> list[Finding]:
     )
     runtime_touched = any(path.startswith("crates/tenferro-runtime/") for path in files)
     if ad_touched and runtime_touched:
-        script = ROOT / "scripts" / "check-ad-boundaries.py"
-        completed = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            detail = completed.stdout.strip() or completed.stderr.strip()
+        violations = runtime_ad_boundary_violations(ref=head, worktree=worktree)
+        if violations:
             findings.append(
                 Finding(
                     id="ad-boundary-runtime",
@@ -500,7 +553,7 @@ def deterministic_checks(files: list[str]) -> list[Finding]:
                     file="crates/tenferro-runtime",
                     line=None,
                     summary="AD symbols leaked into tenferro-runtime boundary",
-                    detail=detail,
+                    detail="\n".join(violations),
                 )
             )
     return findings
@@ -575,7 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     rules_text = build_rules_payload(section_names)
     system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
 
-    findings = deterministic_checks(files)
+    findings = deterministic_checks(files, head=args.head, worktree=args.worktree)
 
     if args.waived:
         report_body = format_report(
