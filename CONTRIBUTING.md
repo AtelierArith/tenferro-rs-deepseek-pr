@@ -28,6 +28,11 @@ Supported entry points:
 
 The shared workflow bodies live in `ai/contribution-workflows/`.
 
+Same-repo pull requests also run an automated delta review against
+`REPOSITORY_RULES.md` (see `ai/README.md` for local usage). Fix
+`severity=block` findings before expecting merge; maintainers may apply the
+`rules-review:waive` label when appropriate.
+
 Use the issue-intake workflow for bug reports, feature requests, design
 discussion issues, and documentation or article topic issues. Use the
 bug-fix PR workflow only for fixes to existing intended behavior. If a proposed
