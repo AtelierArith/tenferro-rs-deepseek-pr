@@ -45,11 +45,17 @@ jobs:
         run: |
           set -euo pipefail
           pr_ref="refs/remotes/origin/pr-${{ github.event.pull_request.number }}"
+          expected_head="${{ github.event.pull_request.head.sha }}"
           git fetch --no-tags --no-recurse-submodules origin \
             "+refs/pull/${{ github.event.pull_request.number }}/head:${pr_ref}"
+          actual_head="$(git rev-parse "${pr_ref}")"
+          if [ "${actual_head}" != "${expected_head}" ]; then
+            echo "Fetched PR head ${actual_head}, but event head is ${expected_head}." >&2
+            exit 1
+          fi
           merge_base="$(git merge-base HEAD "${pr_ref}")"
           echo "base=${merge_base}" >> "${GITHUB_OUTPUT}"
-          echo "head=${pr_ref}" >> "${GITHUB_OUTPUT}"
+          echo "head=${actual_head}" >> "${GITHUB_OUTPUT}"
 
       - name: Run repository rules review
         id: review
@@ -162,9 +168,38 @@ jobs:
                 event.label?.name === labelName &&
                 event.actor?.login
             );
-            const labelActor = labeledEvents.length
-              ? labeledEvents[labeledEvents.length - 1].actor.login
-              : context.actor;
+            const labelEvent = labeledEvents.length
+              ? labeledEvents[labeledEvents.length - 1]
+              : null;
+            if (!labelEvent) {
+              core.setFailed(`Could not find a timeline event for ${labelName}; remove and reapply the label.`);
+              return;
+            }
+            if (context.payload.action === "synchronize") {
+              core.setFailed(`The ${labelName} label must be reapplied after the latest PR push.`);
+              return;
+            }
+            const labelTime = Date.parse(labelEvent.created_at);
+            if (!Number.isFinite(labelTime)) {
+              core.setFailed(`Could not determine when ${labelName} was applied; remove and reapply the label.`);
+              return;
+            }
+            const headUpdateTimes = events
+              .filter(
+                (event) =>
+                  ["committed", "head_ref_force_pushed"].includes(event.event) &&
+                  event.created_at
+              )
+              .map((event) => Date.parse(event.created_at))
+              .filter((time) => Number.isFinite(time));
+            const latestHeadUpdate = headUpdateTimes.length
+              ? Math.max(...headUpdateTimes)
+              : null;
+            if (latestHeadUpdate !== null && labelTime <= latestHeadUpdate) {
+              core.setFailed(`The ${labelName} label is older than the latest PR head update; reapply it.`);
+              return;
+            }
+            const labelActor = labelEvent.actor.login;
             const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
               owner,
               repo,
@@ -187,11 +222,17 @@ jobs:
         run: |
           set -euo pipefail
           pr_ref="refs/remotes/origin/pr-${{ github.event.pull_request.number }}"
+          expected_head="${{ github.event.pull_request.head.sha }}"
           git fetch --no-tags --no-recurse-submodules origin \
             "+refs/pull/${{ github.event.pull_request.number }}/head:${pr_ref}"
+          actual_head="$(git rev-parse "${pr_ref}")"
+          if [ "${actual_head}" != "${expected_head}" ]; then
+            echo "Fetched PR head ${actual_head}, but event head is ${expected_head}." >&2
+            exit 1
+          fi
           merge_base="$(git merge-base HEAD "${pr_ref}")"
           echo "base=${merge_base}" >> "${GITHUB_OUTPUT}"
-          echo "head=${pr_ref}" >> "${GITHUB_OUTPUT}"
+          echo "head=${actual_head}" >> "${GITHUB_OUTPUT}"
       - name: Record LLM skip
         run: |
           set -euo pipefail
@@ -292,9 +333,38 @@ jobs:
                 event.label?.name === labelName &&
                 event.actor?.login
             );
-            const labelActor = labeledEvents.length
-              ? labeledEvents[labeledEvents.length - 1].actor.login
-              : context.actor;
+            const labelEvent = labeledEvents.length
+              ? labeledEvents[labeledEvents.length - 1]
+              : null;
+            if (!labelEvent) {
+              core.setFailed(`Could not find a timeline event for ${labelName}; remove and reapply the label.`);
+              return;
+            }
+            if (context.payload.action === "synchronize") {
+              core.setFailed(`The ${labelName} label must be reapplied after the latest PR push.`);
+              return;
+            }
+            const labelTime = Date.parse(labelEvent.created_at);
+            if (!Number.isFinite(labelTime)) {
+              core.setFailed(`Could not determine when ${labelName} was applied; remove and reapply the label.`);
+              return;
+            }
+            const headUpdateTimes = events
+              .filter(
+                (event) =>
+                  ["committed", "head_ref_force_pushed"].includes(event.event) &&
+                  event.created_at
+              )
+              .map((event) => Date.parse(event.created_at))
+              .filter((time) => Number.isFinite(time));
+            const latestHeadUpdate = headUpdateTimes.length
+              ? Math.max(...headUpdateTimes)
+              : null;
+            if (latestHeadUpdate !== null && labelTime <= latestHeadUpdate) {
+              core.setFailed(`The ${labelName} label is older than the latest PR head update; reapply it.`);
+              return;
+            }
+            const labelActor = labelEvent.actor.login;
             const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
               owner,
               repo,
@@ -317,11 +387,17 @@ jobs:
         run: |
           set -euo pipefail
           pr_ref="refs/remotes/origin/pr-${{ github.event.pull_request.number }}"
+          expected_head="${{ github.event.pull_request.head.sha }}"
           git fetch --no-tags --no-recurse-submodules origin \
             "+refs/pull/${{ github.event.pull_request.number }}/head:${pr_ref}"
+          actual_head="$(git rev-parse "${pr_ref}")"
+          if [ "${actual_head}" != "${expected_head}" ]; then
+            echo "Fetched PR head ${actual_head}, but event head is ${expected_head}." >&2
+            exit 1
+          fi
           merge_base="$(git merge-base HEAD "${pr_ref}")"
           echo "base=${merge_base}" >> "${GITHUB_OUTPUT}"
-          echo "head=${pr_ref}" >> "${GITHUB_OUTPUT}"
+          echo "head=${actual_head}" >> "${GITHUB_OUTPUT}"
       - name: Record waiver
         run: |
           set -euo pipefail

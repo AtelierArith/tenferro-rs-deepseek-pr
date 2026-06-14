@@ -298,8 +298,7 @@ def split_diff_chunks(file_diffs: dict[str, str]) -> list[str]:
                 chunks.append("\n".join(current))
                 current = []
                 current_len = 0
-            for start in range(0, len(piece), MAX_FILE_DIFF_CHARS):
-                chunks.append(piece[start : start + MAX_FILE_DIFF_CHARS])
+            chunks.extend(split_large_file_diff(piece))
             continue
 
         if current_len + len(piece) > MAX_DIFF_CHARS and current:
@@ -312,6 +311,56 @@ def split_diff_chunks(file_diffs: dict[str, str]) -> list[str]:
 
     if current:
         chunks.append("\n".join(current))
+    return chunks
+
+
+def split_large_file_diff(diff_text: str) -> list[str]:
+    """Split one file diff while preserving file headers in every chunk."""
+    lines = diff_text.splitlines()
+    header: list[str] = []
+    hunks: list[list[str]] = []
+    current_hunk: list[str] | None = None
+
+    for line in lines:
+        if line.startswith("@@"):
+            if current_hunk is not None:
+                hunks.append(current_hunk)
+            current_hunk = [line]
+        elif current_hunk is None:
+            header.append(line)
+        else:
+            current_hunk.append(line)
+
+    if current_hunk is not None:
+        hunks.append(current_hunk)
+    if not hunks:
+        return [
+            diff_text[start : start + MAX_FILE_DIFF_CHARS]
+            for start in range(0, len(diff_text), MAX_FILE_DIFF_CHARS)
+        ]
+
+    chunks: list[str] = []
+    current_lines = list(header)
+    current_len = len("\n".join(current_lines))
+
+    for hunk in hunks:
+        hunk_len = len("\n".join(hunk))
+        separator_len = 1 if current_lines else 0
+        if (
+            current_lines != header
+            and current_len + separator_len + hunk_len > MAX_FILE_DIFF_CHARS
+        ):
+            chunks.append("\n".join(current_lines))
+            current_lines = list(header)
+            current_len = len("\n".join(current_lines))
+
+        if current_lines:
+            current_len += 1
+        current_lines.extend(hunk)
+        current_len += hunk_len
+
+    if current_lines != header:
+        chunks.append("\n".join(current_lines))
     return chunks
 
 
@@ -411,10 +460,16 @@ def filter_findings(
     findings: list[Finding],
     files: list[str],
     added_lines: dict[str, set[int]],
+    *,
+    allow_global: bool = True,
 ) -> list[Finding]:
     allowed_files = set(files)
     kept: list[Finding] = []
     for finding in findings:
+        if not finding.file:
+            if allow_global:
+                kept.append(finding)
+            continue
         if finding.file and finding.file not in allowed_files:
             continue
         if finding.line is not None and finding.file in added_lines:
@@ -761,9 +816,15 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=args.timeout,
             )
             llm_findings.extend(chunk_findings)
-        findings.extend(merge_findings(llm_findings))
+        findings.extend(
+            filter_findings(
+                merge_findings(llm_findings),
+                files,
+                added_lines,
+                allow_global=False,
+            )
+        )
 
-    findings = filter_findings(findings, files, added_lines)
     block_findings = [item for item in findings if item.severity == "block"]
     verdict = reconcile_verdict(block_findings)
 
