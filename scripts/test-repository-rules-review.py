@@ -109,6 +109,36 @@ def test_scan_runtime_boundary_text_reports_forbidden_symbol() -> None:
     ]
 
 
+def test_redact_sensitive_text_masks_common_secret_forms() -> None:
+    mod = load_module()
+    api_value = "sk-" + "live-secret-abcdefghijklmnopqrstuvwxyz"
+    github_value = "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"
+    aws_value = "AKIA" + "1234567890ABCDEF"
+    text = "\n".join(
+        [
+            "+DEEPSEEK_" + "API_" + "KEY=" + api_value,
+            "+to" + "ken: " + github_value,
+            "+aws_access_" + "key_id = " + aws_value,
+        ]
+    )
+    redacted = mod.redact_sensitive_text(text)
+    assert api_value not in redacted
+    assert github_value not in redacted
+    assert aws_value not in redacted
+    assert redacted.count("[REDACTED_SECRET]") == 3
+
+
+def test_contains_sensitive_text_ignores_env_lookup_code() -> None:
+    mod = load_module()
+    text = "\n".join(
+        [
+            '+        api_key = os.environ.get("DEEPSEEK_API_KEY")',
+            '+            print("DEEPSEEK_API_KEY is not set", file=sys.stderr)',
+        ]
+    )
+    assert not mod.contains_sensitive_text(text)
+
+
 def main() -> int:
     for test in [
         test_added_lines_by_file,
@@ -119,6 +149,8 @@ def main() -> int:
         test_extract_json_payload_strips_fence,
         test_split_diff_chunks_respects_limit,
         test_scan_runtime_boundary_text_reports_forbidden_symbol,
+        test_redact_sensitive_text_masks_common_secret_forms,
+        test_contains_sensitive_text_ignores_env_lookup_code,
     ]:
         test()
     return 0

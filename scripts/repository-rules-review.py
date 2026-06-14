@@ -34,6 +34,30 @@ MAX_FILE_DIFF_CHARS = 40_000
 RUNTIME_AD_FORBIDDEN = re.compile(
     r"\b(ADRule|EagerRuntime|EagerTensor|autodiff|chainrules|tidu)\b"
 )
+SECRET_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"(?i)\bAuthorization:\s*Bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+)
+SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b("
+    r"[\w.-]*(?:api[_-]?key|token|secret|password|passwd|pwd|client[_-]?secret|"
+    r"private[_-]?key)[\w.-]*"
+    r"\s*[:=]\s*)"
+    r"([^\s#]+)"
+)
+STRICT_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b"
+    r"[\w.-]*(?:api[_-]?key|token|secret|password|passwd|pwd|client[_-]?secret|"
+    r"private[_-]?key)[\w.-]*"
+    r"\s*[:=]\s*"
+    r"(?!os\.environ|re\.compile|\[REDACTED_SECRET\]|tuple\[)"
+    r"[A-Za-z0-9_./+=:@-]{12,}"
+)
 
 ALWAYS_SECTIONS = frozenset(
     {
@@ -291,6 +315,42 @@ def split_diff_chunks(file_diffs: dict[str, str]) -> list[str]:
     return chunks
 
 
+def redact_sensitive_text(text: str) -> str:
+    redacted = text
+    for pattern in SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub("[REDACTED_SECRET]", redacted)
+    return SECRET_ASSIGNMENT.sub(r"\1[REDACTED_SECRET]", redacted)
+
+
+def redact_file_diffs(file_diffs: dict[str, str]) -> dict[str, str]:
+    return {path: redact_sensitive_text(diff) for path, diff in file_diffs.items()}
+
+
+def contains_sensitive_text(text: str) -> bool:
+    return any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS) or bool(
+        STRICT_SECRET_ASSIGNMENT.search(text)
+    )
+
+
+def sensitive_diff_finding(diff_text: str) -> Finding | None:
+    if not contains_sensitive_text(diff_text):
+        return None
+    return Finding(
+        id="sensitive-diff",
+        severity="block",
+        rule_section="External LLM Review",
+        file="",
+        line=None,
+        summary="Sensitive-looking diff content detected before LLM upload",
+        detail=(
+            "External LLM review was skipped because the diff contains token, "
+            "secret, password, authorization header, or private-key shaped text. "
+            "Remove the sensitive value or use a maintainer-approved waiver if "
+            "this is a verified false positive."
+        ),
+    )
+
+
 def parse_findings(raw: Any) -> tuple[str, list[Finding]]:
     if not isinstance(raw, dict):
         raise ValueError("model response must be a JSON object")
@@ -446,6 +506,18 @@ def merge_findings(all_findings: list[Finding]) -> list[Finding]:
     return list(merged.values())
 
 
+def llm_skipped_finding(reason: str) -> Finding:
+    return Finding(
+        id="llm-skipped",
+        severity="warn",
+        rule_section="External LLM Review",
+        file="",
+        line=None,
+        summary="External LLM review was skipped",
+        detail=reason,
+    )
+
+
 def format_report(
     *,
     base: str,
@@ -594,6 +666,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Diff the working tree against --base (includes uncommitted changes)",
     )
+    parser.add_argument(
+        "--llm-skipped-reason",
+        help="Record a maintainer-approved reason when --dry-run intentionally skips LLM review",
+    )
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL))
     parser.add_argument(
         "--api-url",
@@ -601,6 +677,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args(argv)
+
+    if args.llm_skipped_reason and not args.dry_run:
+        print("--llm-skipped-reason requires --dry-run", file=sys.stderr)
+        return 1
 
     configure_dotenv(explicit=args.dotenv, skip=args.no_dotenv)
 
@@ -629,6 +709,11 @@ def main(argv: list[str] | None = None) -> int:
     system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
 
     findings = deterministic_checks(files, head=args.head, worktree=args.worktree)
+    sensitive_finding = sensitive_diff_finding(diff_text)
+    if sensitive_finding:
+        findings.append(sensitive_finding)
+    if args.llm_skipped_reason:
+        findings.append(llm_skipped_finding(args.llm_skipped_reason))
 
     if args.waived:
         report_body = format_report(
@@ -650,7 +735,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return 0
 
-    if not args.dry_run:
+    if not args.dry_run and not sensitive_finding:
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
             print("DEEPSEEK_API_KEY is not set", file=sys.stderr)
@@ -662,7 +747,7 @@ def main(argv: list[str] | None = None) -> int:
             files,
             worktree=args.worktree,
         )
-        chunks = split_diff_chunks(file_diffs)
+        chunks = split_diff_chunks(redact_file_diffs(file_diffs))
         llm_findings: list[Finding] = []
         for chunk in chunks:
             _, chunk_findings = review_chunk(

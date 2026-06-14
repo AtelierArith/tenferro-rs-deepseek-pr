@@ -18,11 +18,14 @@ concurrency:
 
 env:
   REVIEW_WAIVE_LABEL: rules-review:waive
+  REVIEW_NO_LLM_LABEL: rules-review:no-llm
 
 jobs:
   review-bot:
     name: repository rules review (LLM)
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') }}
+    if: |
+      !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') &&
+      !contains(github.event.pull_request.labels.*.name, 'rules-review:no-llm')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -126,13 +129,179 @@ jobs:
           echo "Repository rules review reported block-severity findings."
           exit 1
 
+  review-bot-no-llm:
+    name: repository rules review (LLM skipped)
+    if: |
+      !contains(github.event.pull_request.labels.*.name, 'rules-review:waive') &&
+      contains(github.event.pull_request.labels.*.name, 'rules-review:no-llm')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Verify label actor can skip LLM
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.pull_request.number;
+            const labelName = process.env.REVIEW_NO_LLM_LABEL;
+            const allowed = new Set(["admin", "maintain", "write"]);
+            const events = await github.paginate(github.rest.issues.listEventsForTimeline, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const labeledEvents = events.filter(
+              (event) =>
+                event.event === "labeled" &&
+                event.label?.name === labelName &&
+                event.actor?.login
+            );
+            const labelActor = labeledEvents.length
+              ? labeledEvents[labeledEvents.length - 1].actor.login
+              : context.actor;
+            const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner,
+              repo,
+              username: labelActor,
+            });
+            if (!allowed.has(data.permission)) {
+              core.setFailed(
+                `Actor ${labelActor} has ${data.permission} permission; ` +
+                `the ${labelName} label requires write or higher.`
+              );
+            }
+      - name: Checkout trusted base revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch PR head for diff only
+        id: refs
+        run: |
+          set -euo pipefail
+          pr_ref="refs/remotes/origin/pr-${{ github.event.pull_request.number }}"
+          git fetch --no-tags --no-recurse-submodules origin \
+            "+refs/pull/${{ github.event.pull_request.number }}/head:${pr_ref}"
+          merge_base="$(git merge-base HEAD "${pr_ref}")"
+          echo "base=${merge_base}" >> "${GITHUB_OUTPUT}"
+          echo "head=${pr_ref}" >> "${GITHUB_OUTPUT}"
+      - name: Record LLM skip
+        run: |
+          set -euo pipefail
+          python3 scripts/repository-rules-review.py \
+            --base "${{ steps.refs.outputs.base }}" \
+            --head "${{ steps.refs.outputs.head }}" \
+            --dry-run \
+            --llm-skipped-reason "Skipped by ${REVIEW_NO_LLM_LABEL} label after maintainer review." \
+            | tee review-report.txt
+      - name: Post PR summary comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("node:fs");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.pull_request.number;
+            const maxReportChars = 60000;
+
+            function escapeReport(text) {
+              let value = text;
+              if (value.length > maxReportChars) {
+                value = value.slice(0, maxReportChars) + "\n...[truncated]";
+              }
+              return value
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/@/g, "@&#8203;");
+            }
+
+            let body = "## Repository rules review\n\n";
+            if (fs.existsSync("review-report.txt")) {
+              body += "<pre>" + escapeReport(fs.readFileSync("review-report.txt", "utf8")) + "</pre>\n";
+            } else {
+              body += "Review step did not produce a report.\n";
+            }
+
+            const marker = "<!-- repository-rules-review -->";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(
+              (comment) =>
+                comment.user.type === "Bot" &&
+                comment.body.includes(marker)
+            );
+
+            body += `\n${marker}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
   review-bot-waived:
     name: repository rules review (waived)
     if: ${{ contains(github.event.pull_request.labels.*.name, 'rules-review:waive') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: write
     steps:
+      - name: Verify label actor can waive review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.pull_request.number;
+            const labelName = process.env.REVIEW_WAIVE_LABEL;
+            const allowed = new Set(["admin", "maintain", "write"]);
+            const events = await github.paginate(github.rest.issues.listEventsForTimeline, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const labeledEvents = events.filter(
+              (event) =>
+                event.event === "labeled" &&
+                event.label?.name === labelName &&
+                event.actor?.login
+            );
+            const labelActor = labeledEvents.length
+              ? labeledEvents[labeledEvents.length - 1].actor.login
+              : context.actor;
+            const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner,
+              repo,
+              username: labelActor,
+            });
+            if (!allowed.has(data.permission)) {
+              core.setFailed(
+                `Actor ${labelActor} has ${data.permission} permission; ` +
+                `the ${labelName} label requires write or higher.`
+              );
+            }
       - name: Checkout trusted base revision
         uses: actions/checkout@v5
         with:
@@ -156,27 +325,93 @@ jobs:
             --base "${{ steps.refs.outputs.base }}" \
             --head "${{ steps.refs.outputs.head }}" \
             --waived \
-            --dry-run
+            --dry-run \
+            | tee review-report.txt
+      - name: Post PR summary comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("node:fs");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.pull_request.number;
+            const maxReportChars = 60000;
+
+            function escapeReport(text) {
+              let value = text;
+              if (value.length > maxReportChars) {
+                value = value.slice(0, maxReportChars) + "\n...[truncated]";
+              }
+              return value
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/@/g, "@&#8203;");
+            }
+
+            let body = "## Repository rules review\n\n";
+            if (fs.existsSync("review-report.txt")) {
+              body += "<pre>" + escapeReport(fs.readFileSync("review-report.txt", "utf8")) + "</pre>\n";
+            } else {
+              body += "Review step did not produce a report.\n";
+            }
+
+            const marker = "<!-- repository-rules-review -->";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(
+              (comment) =>
+                comment.user.type === "Bot" &&
+                comment.body.includes(marker)
+            );
+
+            body += `\n${marker}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
 
   review-bot-gate:
     name: repository rules review
-    needs: [review-bot, review-bot-waived]
+    needs: [review-bot, review-bot-no-llm, review-bot-waived]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Require review result
         env:
           REVIEW_RESULT: ${{ needs.review-bot.result }}
+          NO_LLM_RESULT: ${{ needs.review-bot-no-llm.result }}
           WAIVED_RESULT: ${{ needs.review-bot-waived.result }}
           REVIEW_WAIVE_LABEL: ${{ env.REVIEW_WAIVE_LABEL }}
+          REVIEW_NO_LLM_LABEL: ${{ env.REVIEW_NO_LLM_LABEL }}
         run: |
           set -euo pipefail
           if [ "${WAIVED_RESULT}" = "success" ]; then
             echo "Review waived via label ${REVIEW_WAIVE_LABEL}."
             exit 0
           fi
+          if [ "${NO_LLM_RESULT}" = "success" ]; then
+            echo "LLM review skipped via label ${REVIEW_NO_LLM_LABEL}; deterministic checks passed."
+            exit 0
+          fi
           if [ "${REVIEW_RESULT}" = "success" ]; then
             exit 0
           fi
-          echo "Expected review-bot success or waiver; got review-bot=${REVIEW_RESULT} waived=${WAIVED_RESULT}"
+          echo "Expected review-bot success, no-LLM skip, or waiver; got review-bot=${REVIEW_RESULT} no-llm=${NO_LLM_RESULT} waived=${WAIVED_RESULT}"
           exit 1
