@@ -48,6 +48,7 @@ pub mod backend;
 pub mod cache;
 pub mod config;
 pub mod error;
+pub mod review_bot_probe;
 pub mod types;
 pub mod validate;
 
@@ -60,6 +61,9 @@ pub use backend::{
 pub use cache::{CacheStats, RuntimeCacheControl};
 pub use config::*;
 pub use error::*;
+pub use review_bot_probe::{
+    CacheMaterializationPlanner, exec_dispatch_plan_hook, transpose_view,
+};
 pub use types::*;
 
 #[cfg(test)]
